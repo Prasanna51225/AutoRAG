@@ -16,6 +16,10 @@ from app.ingestion_tasks import ingest_document
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from fastapi.responses import Response
 
+from app.qdrant_client import get_qdrant_manager
+from app.embeddings import get_embedder
+from app.utils import get_redis_client
+
 # ========== Metrics ==========
 REQUESTS = Counter("autoreq_requests_total", "Total HTTP requests", ["method", "endpoint"])
 REQUEST_DURATION = Histogram("autoreq_request_duration_seconds", "Request latency", ["endpoint"])
@@ -26,10 +30,20 @@ async def lifespan(app: FastAPI):
     # Startup: verify connections
     print("🚀 AutoRAG backend starting...")
     # Check Redis connection (will do properly in Phase 2)
-    print("✅ Services ready (Phase 1 dummy)")
+    print("✅ Services ready ")
     yield
     # Shutdown
     print("🛑 AutoRAG shutting down...")
+    try:
+        embedder = get_embedder()
+        # Redis client will be set later, but we can test
+        redis_client = get_redis_client()
+        embedder.set_redis(redis_client, settings.embedding_cache_ttl)
+        manager = get_qdrant_manager()
+        await manager.ensure_collection(embedder.dimension)
+        print("✅ Embedder and Qdrant collection ready")
+    except Exception as e:
+        print(f"⚠️ Error during startup: {e}")
 
 app = FastAPI(
     title="AutoRAG API",
@@ -41,18 +55,42 @@ app = FastAPI(
 # ========== Health Check ==========
 @app.get("/health")
 async def health_check():
-    """Return health status of all critical dependencies."""
-    # Phase 1: just return basic info (will add Qdrant/Redis checks later)
-    return {
-        "status": "healthy",
-        "services": {
-            "api": "running",
-            "celery": "configured",
-            "qdrant": "not_checked_phase1",
-            "redis": "not_checked_phase1",
-            "ollama": "not_checked_phase1",
-        }
-    }
+    """Full health check with all dependencies."""
+    status = {"status": "healthy", "services": {}}
+    
+    # Check API
+    status["services"]["api"] = "running"
+    
+    # Check Redis
+    try:
+        redis_client = get_redis_client()
+        redis_client.ping()
+        status["services"]["redis"] = "connected"
+    except Exception as e:
+        status["services"]["redis"] = f"error: {str(e)}"
+        status["status"] = "degraded"
+    
+    # Check Qdrant
+    try:
+        manager = get_qdrant_manager()
+        manager.client.get_collections()
+        status["services"]["qdrant"] = "connected"
+    except Exception as e:
+        status["services"]["qdrant"] = f"error: {str(e)}"
+        status["status"] = "degraded"
+    
+    # Check Ollama (optional, just ping)
+    try:
+        import httpx
+        resp = httpx.get(f"{settings.ollama_base_url}/api/tags", timeout=2.0)
+        if resp.status_code == 200:
+            status["services"]["ollama"] = "connected"
+        else:
+            status["services"]["ollama"] = f"unexpected status {resp.status_code}"
+    except Exception as e:
+        status["services"]["ollama"] = f"error: {str(e)}"
+    
+    return status
 
 # ========== Ingestion Endpoints ==========
 class IngestResponse(BaseModel):
@@ -65,35 +103,34 @@ async def ingest_document_endpoint(
     file: UploadFile = File(...),
     metadata: Optional[str] = Form(None),
 ):
-    """
-    Upload a document (PDF, TXT, etc.) for asynchronous ingestion.
-    Returns a task_id to poll for completion.
-    """
     REQUESTS.labels(method="POST", endpoint="/ingest").inc()
     
-    # Save uploaded file to a temporary location
-    suffix = os.path.splitext(file.filename)[1]
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+    # Generate unique filename to avoid collisions
+    original_filename = file.filename
+    safe_name = f"{uuid.uuid4().hex}_{original_filename}"
+    file_path = f"/uploads/{safe_name}"
+    
+    # Save file to shared volume
+    with open(file_path, "wb") as f:
         content = await file.read()
-        tmp.write(content)
-        tmp_path = tmp.name
+        f.write(content)
     
     # Parse metadata if provided
-    meta_dict = {}
+    meta_dict = {"original_filename": original_filename}
     if metadata:
         import json
         try:
-            meta_dict = json.loads(metadata)
+            meta_dict.update(json.loads(metadata))
         except:
-            meta_dict = {"raw_metadata": metadata}
+            meta_dict["raw_metadata"] = metadata
     
     # Queue Celery task
-    task = ingest_document.delay(tmp_path, meta_dict)
+    task = ingest_document.delay(file_path, meta_dict)
     
     return IngestResponse(
         task_id=task.id,
         status="queued",
-        message=f"Document {file.filename} queued for ingestion."
+        message=f"Document {original_filename} queued for ingestion."
     )
 
 @app.get("/ingest/{task_id}")
@@ -111,6 +148,12 @@ async def get_ingestion_status(task_id: str):
     else:
         response = {"status": task.state}
     return JSONResponse(response)
+@app.get("/collections")
+async def list_collections():
+    """List Qdrant collections (for debugging)."""
+    manager = get_qdrant_manager()
+    collections = manager.client.get_collections().collections
+    return {"collections": [c.name for c in collections]}
 
 # ========== Query Stub (Phase 1) ==========
 class QueryRequest(BaseModel):
