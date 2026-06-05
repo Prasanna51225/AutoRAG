@@ -1,1 +1,1 @@
-"This is a sample document." 
+"A reflexion loop is a technique where the system evaluates its own output and improves it iteratively." 

@@ -1,4 +1,5 @@
 services:
+  # ========== Core Services ==========
   qdrant:
     image: qdrant/qdrant:latest
     container_name: autoreag_qdrant
@@ -39,9 +40,9 @@ services:
     restart: unless-stopped
     networks:
       - autoreag_net
-    command: >
-      sh -c "ollama serve & sleep 5 && ollama pull llama3.2:3b && wait"
+    # DO NOT override command – let the image's default entrypoint run "ollama serve"
 
+  # ========== Backend & Worker ==========
   backend:
     build: .
     container_name: autoreag_backend
@@ -72,7 +73,13 @@ services:
     restart: unless-stopped
     networks:
       - autoreag_net
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --timeout-keep-alive 120
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
 
   celery_worker:
     build: .
@@ -103,6 +110,7 @@ services:
       - autoreag_net
     command: celery -A app.celery_app worker --loglevel=info --concurrency=2
 
+  # ========== Observability ==========
   prometheus:
     image: prom/prometheus:latest
     container_name: autoreag_prometheus
