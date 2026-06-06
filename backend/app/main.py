@@ -1,12 +1,10 @@
 # backend/app/main.py
 import time
 import json
-import tempfile
-import os
 from contextlib import asynccontextmanager
 from typing import Dict, Any, List, Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 import httpx
@@ -19,6 +17,8 @@ from app.embeddings import get_embedder
 from app.retriever import get_retriever
 from app.reranker import get_reranker
 from app.utils import get_redis_client, get_logger
+from app.graph import get_graph
+from app.state import ReflexionState
 
 # Prometheus metrics
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
@@ -72,6 +72,10 @@ async def lifespan(app: FastAPI):
         retriever.set_redis(redis_client, settings.embedding_cache_ttl)
         reranker = get_reranker()
         print("✅ Retriever and reranker ready")
+        
+        # Preload graph (compiles once)
+        graph = get_graph()
+        print("✅ LangGraph reflexion loop ready")
         
     except Exception as e:
         print(f"⚠️ Startup error: {e}")
@@ -227,29 +231,39 @@ async def test_retrieve(request: RetrieveRequest):
         retrieval_time_ms=round(elapsed_ms, 2)
     )
 
-# ========== Query Stub (Phase 3) ==========
+# ========== Reflexion Loop Query Endpoint ==========
 @app.post("/query", response_model=QueryResponse)
 async def query_endpoint(request: QueryRequest):
-    """
-    Phase 3 stub – will be replaced with full reflexion loop in Phase 4.
-    """
     REQUESTS.labels(method="POST", endpoint="/query").inc()
-    retriever = get_retriever()
-    reranker = get_reranker()
-    retrieved = await retriever.retrieve(request.query, top_k=settings.reranker_cutoff)
-    final_chunks = await reranker.rerank(request.query, retrieved, top_k=3)
+    start_time = time.time()
+
+    from app.graph import get_graph, _get_empty_state
+    graph = get_graph()
+    initial_state = _get_empty_state(request.query)
     
-    answer = f"This is a Phase 3 stub. Retrieved {len(final_chunks)} relevant chunks."
-    if final_chunks:
-        answer += f" First chunk: {final_chunks[0]['text'][:100]}..."
+    try:
+        final_state = await graph.ainvoke(initial_state)
+    except Exception as e:
+        logger.error(f"Graph execution failed: {e}")
+        return QueryResponse(
+            answer=f"Error in reflexion loop: {str(e)}",
+            metadata={"error": str(e), "query": request.query}
+        )
     
+    elapsed_ms = (time.time() - start_time) * 1000
+    metadata = {
+        "phase": 4,
+        "original_query": request.query,
+        "final_query": final_state.get("current_query", request.query),
+        "loop_count": final_state.get("loop_count", 0),
+        "critic_score": final_state.get("critique_score"),
+        "critic_reason": final_state.get("critique_reason", ""),
+        "chunks_used": len(final_state.get("retrieved_chunks", [])),
+        "total_latency_ms": round(elapsed_ms, 2)
+    }
     return QueryResponse(
-        answer=answer,
-        metadata={
-            "phase": 3,
-            "query": request.query,
-            "chunks_retrieved": len(final_chunks),
-        }
+        answer=final_state.get("final_answer", "No answer generated."),
+        metadata=metadata
     )
 
 # ========== Debug/Utility Endpoints ==========
@@ -269,10 +283,11 @@ async def metrics():
 async def root():
     return {
         "service": "AutoRAG",
-        "phase": 3,
+        "phase": 4,
         "docs": "/docs",
         "health": "/health",
         "metrics": "/metrics",
         "retrieve": "/retrieve (POST)",
+        "query": "/query (POST with reflexion loop)",
         "ingest": "/ingest (POST)"
     }
