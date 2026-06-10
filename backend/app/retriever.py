@@ -3,7 +3,6 @@ import asyncio
 import hashlib
 import json
 from typing import List, Dict, Any, Optional
-from qdrant_client.http.models import SparseVector
 from app.config import settings
 from app.qdrant_client import get_qdrant_manager
 from app.embeddings import get_embedder
@@ -38,20 +37,11 @@ class HybridRetriever:
         self.embedder = get_embedder()
         self.sparse_vectorizer = get_sparse_vectorizer()
         self.cache = None
-        logger.info("HybridRetriever initialised")
+        logger.info("HybridRetriever initialised (dense-only)")
 
     def set_redis(self, redis_client: redis.Redis, ttl: int = 3600):
         self.cache = QueryCache(redis_client, ttl)
         self.embedder.set_redis(redis_client, ttl)
-
-    async def _get_query_vectors(self, query: str):
-        dense_vec = await self.embedder.embed(query)
-        sparse_vec = self.sparse_vectorizer.vectorize(query)
-        # Ensure sparse vector is not empty – Qdrant requires at least one index
-        if not sparse_vec:
-            # Add a dummy token with very low weight (will still work)
-            sparse_vec = {0: 0.001}
-        return dense_vec, sparse_vec
 
     async def retrieve(self, query: str, top_k: int = 20) -> List[Dict[str, Any]]:
         if self.cache:
@@ -60,33 +50,16 @@ class HybridRetriever:
                 logger.debug(f"Cache hit for query: {query[:50]}")
                 return cached
 
-        dense_vec, sparse_vec = await self._get_query_vectors(query)
+        dense_vec = await self.embedder.embed(query)
 
-        # Create Qdrant SparseVector
-        qdrant_sparse = SparseVector(
-            indices=list(sparse_vec.keys()),
-            values=list(sparse_vec.values())
+        # Use named vector "dense" (must match collection vector name)
+        results = await asyncio.to_thread(
+            self.qdrant.client.search,
+            collection_name=self.qdrant.collection_name,
+            query_vector=("dense", dense_vec),   # Tuple: (vector_name, vector)
+            limit=top_k,
+            with_payload=True,
         )
-
-        try:
-            # Execute hybrid search
-            results = await asyncio.to_thread(
-                self.qdrant.client.search,
-                collection_name=self.qdrant.collection_name,
-                query_vector=("dense", dense_vec),
-                query_sparse_vector=qdrant_sparse,
-                limit=top_k,
-                with_payload=True,
-            )
-        except Exception as e:
-            logger.error(f"Hybrid search failed: {e}, falling back to dense only")
-            results = await asyncio.to_thread(
-                self.qdrant.client.search,
-                collection_name=self.qdrant.collection_name,
-                query_vector=("dense", dense_vec),
-                limit=top_k,
-                with_payload=True,
-            )
 
         chunks = []
         for hit in results:

@@ -1,11 +1,12 @@
-# backend/app/celery_app.py
 from celery import Celery
-from app.config import settings
+import os
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
 
 celery_app = Celery(
     "autoreag",
-    broker=settings.celery_broker_url,
-    backend=settings.celery_result_backend,
+    broker=REDIS_URL,
+    backend=REDIS_URL,
 )
 
 celery_app.conf.update(
@@ -15,11 +16,10 @@ celery_app.conf.update(
     timezone="UTC",
     enable_utc=True,
     task_track_started=True,
-    task_time_limit=30 * 60,  # 30 minutes
+    task_time_limit=30 * 60,
     task_soft_time_limit=25 * 60,
     worker_prefetch_multiplier=1,
     task_acks_late=True,
 )
 
-# Auto-discover tasks from the 'ingestion_tasks' module
 celery_app.autodiscover_tasks(["app.ingestion_tasks"], force=True)

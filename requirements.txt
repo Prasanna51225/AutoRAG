@@ -7,11 +7,13 @@ langgraph==0.2.60
 langchain==0.3.13
 langchain-community==0.3.13
 langsmith==0.1.147
+langchain-text-splitters>=0.3.0
 
-qdrant-client==1.11.0
+qdrant-client==1.11.3
 
 sentence-transformers==3.0.1
-torch==2.4.1
+torch==2.4.1 --index-url https://download.pytorch.org/whl/cpu
+
 ollama==0.3.3
 
 redis==5.0.8
@@ -31,4 +33,5 @@ requests==2.32.3
 PyYAML==6.0.2
 sqlalchemy==2.0.35
 numpy==1.26.4
-langgraph>=0.2.0
+transformers==4.44.2
+python-dateutil==2.9.0.post0

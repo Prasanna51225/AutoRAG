@@ -21,11 +21,19 @@ class Settings(BaseSettings):
     
     # Reranker
     reranker_model: str = Field(default="BAAI/bge-reranker-base", alias="RERANKER_MODEL")
-    reranker_cutoff: int = Field(default=20, alias="RERANKER_CUTOFF")
+    reranker_cutoff: int = Field(default=50, alias="RERANKER_CUTOFF")
     
     # Reflexion loop
     max_loops: int = Field(default=3, alias="MAX_LOOPS")
-    critic_threshold: float = Field(default=0.7, alias="CRITIC_THRESHOLD")
+    critic_threshold: float = Field(default=0.3, alias="CRITIC_THRESHOLD")
+    
+    # Retrieval
+    hybrid_alpha: float = Field(default=0.6, alias="HYBRID_ALPHA")
+    dynamic_topk: bool = Field(default=True, alias="DYNAMIC_TOPK")
+    
+    # Chunking
+    chunk_size: int = Field(default=1024, alias="CHUNK_SIZE")
+    chunk_overlap: int = Field(default=256, alias="CHUNK_OVERLAP")
     
     # LangSmith
     langsmith_api_key: Optional[str] = Field(default=None, alias="LANGSMITH_API_KEY")

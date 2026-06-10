@@ -43,3 +43,15 @@ def parse_document(file_path: str) -> str:
             return f.read()
     else:
         raise ValueError(f"Unsupported file type: {ext}")
+
+import httpx
+from app.config import settings
+
+async def call_ollama(prompt: str, model: str = None) -> str:
+    model = model or settings.ollama_model
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            f"{settings.ollama_base_url}/api/generate",
+            json={"model": model, "prompt": prompt, "stream": False}
+        )
+        return resp.json()["response"]

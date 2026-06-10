@@ -1,11 +1,14 @@
 # backend/app/main.py
 import time
 import json
+import tempfile
+import os
 from contextlib import asynccontextmanager
 from typing import Dict, Any, List, Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
 from fastapi.responses import JSONResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import httpx
 
@@ -16,9 +19,12 @@ from app.qdrant_client import get_qdrant_manager
 from app.embeddings import get_embedder
 from app.retriever import get_retriever
 from app.reranker import get_reranker
-from app.utils import get_redis_client, get_logger
+from app.critic import get_critic
+from app.rewriter import get_rewriter
+from app.generator import get_generator
 from app.graph import get_graph
 from app.state import ReflexionState
+from app.utils import get_redis_client, get_logger
 
 # Prometheus metrics
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
@@ -62,24 +68,30 @@ async def lifespan(app: FastAPI):
         embedder = get_embedder()
         redis_client = get_redis_client()
         embedder.set_redis(redis_client, settings.embedding_cache_ttl)
-        
+
         qdrant_manager = get_qdrant_manager()
         await qdrant_manager.ensure_collection(embedder.dimension)
         print("✅ Embedder and Qdrant collection ready")
-        
-        # Preload retriever and reranker
+
+        # Preload retriever and reranker (this downloads reranker model now)
         retriever = get_retriever()
         retriever.set_redis(redis_client, settings.embedding_cache_ttl)
         reranker = get_reranker()
-        print("✅ Retriever and reranker ready")
-        
-        # Preload graph (compiles once)
+        print("✅ Retriever and reranker ready (reranker model loaded)")
+
+        # Preload critic, rewriter, generator (no heavy downloads, but initialise clients)
+        critic = get_critic()
+        rewriter = get_rewriter()
+        generator = get_generator()
+        print("✅ Critic, Rewriter, Generator ready")
+
+        # Preload LangGraph (optional, but ensures graph is built)
         graph = get_graph()
         print("✅ LangGraph reflexion loop ready")
-        
+
     except Exception as e:
         print(f"⚠️ Startup error: {e}")
-    
+
     yield
     # Shutdown
     print("🛑 AutoRAG shutting down...")
@@ -91,15 +103,24 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://localhost:5173", "http://frontend:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ========== Health Check ==========
 @app.get("/health")
 async def health_check():
     """Full health check with all dependencies."""
     status = {"status": "healthy", "services": {}}
-    
+
     # API
     status["services"]["api"] = "running"
-    
+
     # Redis
     try:
         redis_client = get_redis_client()
@@ -108,7 +129,7 @@ async def health_check():
     except Exception as e:
         status["services"]["redis"] = f"error: {str(e)}"
         status["status"] = "degraded"
-    
+
     # Qdrant
     try:
         qdrant_manager = get_qdrant_manager()
@@ -117,7 +138,7 @@ async def health_check():
     except Exception as e:
         status["services"]["qdrant"] = f"error: {str(e)}"
         status["status"] = "degraded"
-    
+
     # Ollama
     try:
         async with httpx.AsyncClient() as client:
@@ -130,7 +151,7 @@ async def health_check():
     except Exception as e:
         status["services"]["ollama"] = f"error: {str(e)}"
         status["status"] = "degraded"
-    
+
     # Retriever / Reranker status
     try:
         retriever = get_retriever()
@@ -140,7 +161,7 @@ async def health_check():
     except Exception as e:
         status["services"]["retriever_reranker"] = f"error: {str(e)}"
         status["status"] = "degraded"
-    
+
     return status
 
 # ========== Ingestion Endpoints ==========
@@ -154,17 +175,16 @@ async def ingest_document_endpoint(
     Returns a task_id to poll for completion.
     """
     REQUESTS.labels(method="POST", endpoint="/ingest").inc()
-    
+
     # Read file content
     content = await file.read()
-    
+
     # Try to decode as text (for TXT files)
     try:
         file_content = content.decode("utf-8", errors="replace")
     except Exception:
-        # For PDF or binary, we would use a PDF parser, but for simplicity we assume TXT
-        raise HTTPException(status_code=400, detail="Only text files are supported in this demo")
-    
+        raise HTTPException(status_code=400, detail="Only text files are supported in this demo (PDF support can be added)")
+
     # Parse metadata if provided
     meta_dict = {}
     if metadata:
@@ -174,10 +194,10 @@ async def ingest_document_endpoint(
             meta_dict = {"raw_metadata": metadata}
     meta_dict["filename"] = file.filename
     meta_dict["content_type"] = file.content_type
-    
-    # Queue Celery task with content string instead of file path
+
+    # Queue Celery task with content string
     task = ingest_document.delay(file_content, meta_dict)
-    
+
     return IngestResponse(
         task_id=task.id,
         status="queued",
@@ -215,15 +235,13 @@ async def test_retrieve(request: RetrieveRequest):
     """
     REQUESTS.labels(method="POST", endpoint="/retrieve").inc()
     start_time = time.time()
-    
+
     retriever = get_retriever()
     reranker = get_reranker()
-    
-    # Retrieve top-k from retriever (using configured cutoff)
+
     retrieved = await retriever.retrieve(request.query, top_k=settings.reranker_cutoff)
-    # Rerank and get final top_k
     final_chunks = await reranker.rerank(request.query, retrieved, top_k=request.top_k)
-    
+
     elapsed_ms = (time.time() - start_time) * 1000
     return RetrieveResponse(
         query=request.query,
@@ -231,40 +249,43 @@ async def test_retrieve(request: RetrieveRequest):
         retrieval_time_ms=round(elapsed_ms, 2)
     )
 
-# ========== Reflexion Loop Query Endpoint ==========
+# ========== Full Reflexion Query ==========
 @app.post("/query", response_model=QueryResponse)
 async def query_endpoint(request: QueryRequest):
+    """
+    Full reflexion loop: retrieve → critic → (rewrite) → generate.
+    Returns answer and metadata (loops, scores, etc.).
+    """
     REQUESTS.labels(method="POST", endpoint="/query").inc()
     start_time = time.time()
-
-    from app.graph import get_graph, _get_empty_state
-    graph = get_graph()
-    initial_state = _get_empty_state(request.query)
     
-    try:
-        final_state = await graph.ainvoke(initial_state)
-    except Exception as e:
-        logger.error(f"Graph execution failed: {e}")
-        return QueryResponse(
-            answer=f"Error in reflexion loop: {str(e)}",
-            metadata={"error": str(e), "query": request.query}
-        )
+    # Initialise state (as a dict, because LangGraph uses dicts)
+    initial_state = ReflexionState(
+        original_query=request.query,
+        current_query=request.query,
+        loop_count=0,
+    ).dict()  # convert to dict for LangGraph
+    
+    # Execute LangGraph
+    graph = get_graph()
+    final_state = await graph.ainvoke(initial_state)
     
     elapsed_ms = (time.time() - start_time) * 1000
+    
+    # Access as dictionary (not attribute)
     metadata = {
         "phase": 4,
         "original_query": request.query,
         "final_query": final_state.get("current_query", request.query),
         "loop_count": final_state.get("loop_count", 0),
         "critic_score": final_state.get("critique_score"),
-        "critic_reason": final_state.get("critique_reason", ""),
+        "critic_reason": final_state.get("critique_reason"),
         "chunks_used": len(final_state.get("retrieved_chunks", [])),
         "total_latency_ms": round(elapsed_ms, 2)
     }
-    return QueryResponse(
-        answer=final_state.get("final_answer", "No answer generated."),
-        metadata=metadata
-    )
+    
+    answer = final_state.get("final_answer", "No answer generated.")
+    return QueryResponse(answer=answer, metadata=metadata)
 
 # ========== Debug/Utility Endpoints ==========
 @app.get("/test_embedding")

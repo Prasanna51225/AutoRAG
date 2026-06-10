@@ -1,5 +1,4 @@
 services:
-  # ========== Core Services ==========
   qdrant:
     image: qdrant/qdrant:latest
     container_name: autoreag_qdrant
@@ -8,9 +7,6 @@ services:
       - "6334:6334"
     volumes:
       - qdrant_storage:/qdrant/storage
-    environment:
-      - QDRANT__SERVICE__HTTP_PORT=6333
-      - QDRANT__SERVICE__GRPC_PORT=6334
     restart: unless-stopped
     networks:
       - autoreag_net
@@ -36,34 +32,37 @@ services:
       - ollama_models:/root/.ollama
     environment:
       - OLLAMA_HOST=0.0.0.0
-      - OLLAMA_ORIGINS=*
     restart: unless-stopped
     networks:
       - autoreag_net
-    # DO NOT override command – let the image's default entrypoint run "ollama serve"
+    entrypoint: /bin/sh
+    command: >
+      -c "ollama serve &
+      sleep 5 &&
+      ollama pull llama3.2:3b &&
+      wait"
 
-  # ========== Backend & Worker ==========
   backend:
     build: .
     container_name: autoreag_backend
     ports:
       - "8000:8000"
     environment:
-      - QDRANT_HOST=${QDRANT_HOST}
-      - QDRANT_PORT=${QDRANT_PORT}
-      - REDIS_URL=${REDIS_URL}
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
-      - OLLAMA_MODEL=${OLLAMA_MODEL}
-      - EMBEDDING_CACHE_TTL=${EMBEDDING_CACHE_TTL}
-      - RERANKER_MODEL=${RERANKER_MODEL}
-      - RERANKER_CUTOFF=${RERANKER_CUTOFF}
-      - MAX_LOOPS=${MAX_LOOPS}
-      - CRITIC_THRESHOLD=${CRITIC_THRESHOLD}
-      - LANGSMITH_API_KEY=${LANGSMITH_API_KEY}
-      - LANGSMITH_TRACING=${LANGSMITH_TRACING}
-      - LANGSMITH_PROJECT=${LANGSMITH_PROJECT}
-      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
-      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - REDIS_URL=redis://redis:6379/0
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=llama3.2:3b
+      - EMBEDDING_CACHE_TTL=3600
+      - RERANKER_MODEL=BAAI/bge-reranker-base
+      - RERANKER_CUTOFF=50
+      - MAX_LOOPS=3
+      - CRITIC_THRESHOLD=0.3
+      - HYBRID_ALPHA=0.6
+      - DYNAMIC_TOPK=true
+      - CHUNK_SIZE=1024
+      - CHUNK_OVERLAP=256
+      - CUDA_VISIBLE_DEVICES=
     volumes:
       - ./backend:/app
     depends_on:
@@ -73,33 +72,23 @@ services:
     restart: unless-stopped
     networks:
       - autoreag_net
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --timeout-keep-alive 120
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 120s
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
   celery_worker:
     build: .
     container_name: autoreag_celery
     environment:
-      - QDRANT_HOST=${QDRANT_HOST}
-      - QDRANT_PORT=${QDRANT_PORT}
-      - REDIS_URL=${REDIS_URL}
-      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL}
-      - OLLAMA_MODEL=${OLLAMA_MODEL}
-      - EMBEDDING_CACHE_TTL=${EMBEDDING_CACHE_TTL}
-      - RERANKER_MODEL=${RERANKER_MODEL}
-      - RERANKER_CUTOFF=${RERANKER_CUTOFF}
-      - MAX_LOOPS=${MAX_LOOPS}
-      - CRITIC_THRESHOLD=${CRITIC_THRESHOLD}
-      - LANGSMITH_API_KEY=${LANGSMITH_API_KEY}
-      - LANGSMITH_TRACING=${LANGSMITH_TRACING}
-      - LANGSMITH_PROJECT=${LANGSMITH_PROJECT}
-      - CELERY_BROKER_URL=${CELERY_BROKER_URL}
-      - CELERY_RESULT_BACKEND=${CELERY_RESULT_BACKEND}
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=llama3.2:3b
+      - RERANKER_CUTOFF=50
+      - CRITIC_THRESHOLD=0.3
+      - CUDA_VISIBLE_DEVICES=
+      - OMP_NUM_THREADS=1
     volumes:
       - ./backend:/app
     depends_on:
@@ -108,9 +97,8 @@ services:
     restart: unless-stopped
     networks:
       - autoreag_net
-    command: celery -A app.celery_app worker --loglevel=info --concurrency=2
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=1 --pool=solo
 
-  # ========== Observability ==========
   prometheus:
     image: prom/prometheus:latest
     container_name: autoreag_prometheus
@@ -133,11 +121,22 @@ services:
       - "3001:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_INSTALL_PLUGINS=grafana-piechart-panel
     volumes:
       - grafana_data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning
     restart: unless-stopped
+    networks:
+      - autoreag_net
+
+  frontend:
+    build: ./frontend
+    container_name: autoreag_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - backend
     networks:
       - autoreag_net
 
