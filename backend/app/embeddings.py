@@ -1,4 +1,3 @@
-# backend/app/embeddings.py
 import asyncio
 import hashlib
 import json
@@ -19,15 +18,12 @@ class EmbeddingCache:
         return f"embed:{hashlib.md5(text.encode()).hexdigest()}"
 
     def get(self, text: str) -> Optional[List[float]]:
-        key = self._key(text)
-        cached = self.redis.get(key)
-        if cached:
-            return json.loads(cached)
-        return None
+        cached = self.redis.get(self._key(text))
+        return json.loads(cached) if cached else None
 
     def set(self, text: str, embedding: List[float]):
-        key = self._key(text)
-        self.redis.setex(key, self.ttl, json.dumps(embedding))
+        self.redis.setex(self._key(text), self.ttl, json.dumps(embedding))
+
 
 class DenseEmbedder:
     def __init__(self, model_name: str = "sentence-transformers/all-MiniLM-L6-v2"):
@@ -66,15 +62,16 @@ class DenseEmbedder:
                     uncached_texts.append(t)
         else:
             uncached_indices = list(range(len(texts)))
-            uncached_texts = texts
+            uncached_texts = texts[:]
+
         if uncached_texts:
             loop = asyncio.get_event_loop()
             embeddings = await loop.run_in_executor(None, self.model.encode, uncached_texts)
-            for idx, emb in zip(uncached_indices, embeddings):
+            for local_i, (global_i, emb) in enumerate(zip(uncached_indices, embeddings)):
                 emb_list = emb.tolist()
-                results[idx] = emb_list
+                results[global_i] = emb_list
                 if self.cache:
-                    self.cache.set(uncached_texts[uncached_indices.index(idx)], emb_list)
+                    self.cache.set(uncached_texts[local_i], emb_list)
         return results
 
 _embedder = None

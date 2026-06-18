@@ -1,12 +1,10 @@
-# backend/app/utils.py
 import logging
 import redis
 from typing import Optional
-from pypdf import PdfReader
 import os
 from app.config import settings
+import httpx
 
-# Logger setup
 def get_logger(name: str) -> logging.Logger:
     logger = logging.getLogger(name)
     if not logger.handlers:
@@ -17,22 +15,19 @@ def get_logger(name: str) -> logging.Logger:
         logger.setLevel(logging.INFO)
     return logger
 
-# Redis client (singleton)
 _redis_client = None
 
 def get_redis_client() -> redis.Redis:
     global _redis_client
     if _redis_client is None:
         _redis_client = redis.Redis.from_url(settings.redis_url, decode_responses=False)
-        _redis_client.ping()  # verify connection
+        _redis_client.ping()
     return _redis_client
 
 def parse_document(file_path: str) -> str:
-    """
-    Extract text from PDF or plain text file.
-    """
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".pdf":
+        from pypdf import PdfReader
         reader = PdfReader(file_path)
         text = "\n".join([page.extract_text() or "" for page in reader.pages])
         if not text.strip():
@@ -43,9 +38,6 @@ def parse_document(file_path: str) -> str:
             return f.read()
     else:
         raise ValueError(f"Unsupported file type: {ext}")
-
-import httpx
-from app.config import settings
 
 async def call_ollama(prompt: str, model: str = None) -> str:
     model = model or settings.ollama_model

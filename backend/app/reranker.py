@@ -1,4 +1,3 @@
-# backend/app/reranker.py
 import asyncio
 from typing import List, Dict, Any
 from sentence_transformers import CrossEncoder
@@ -16,14 +15,28 @@ class Reranker:
     async def rerank(self, query: str, chunks: List[Dict[str, Any]], top_k: int = 5) -> List[Dict[str, Any]]:
         if not chunks:
             return []
-        chunks_to_rerank = chunks[:self.cutoff]
-        pairs = [(query, chunk["text"]) for chunk in chunks_to_rerank]
-        loop = asyncio.get_event_loop()
-        scores = await loop.run_in_executor(None, self.model.predict, pairs)
-        for chunk, score in zip(chunks_to_rerank, scores):
-            chunk["rerank_score"] = float(score)
-        chunks_to_rerank.sort(key=lambda x: x["rerank_score"], reverse=True)
-        return chunks_to_rerank[:top_k]
+
+        # Separate summary chunks (always kept) from normal chunks
+        summary_chunks = [c for c in chunks if c.get("metadata", {}).get("is_summary")]
+        normal_chunks = [c for c in chunks if not c.get("metadata", {}).get("is_summary")]
+
+        # Score normal chunks (up to cutoff)
+        to_score = normal_chunks[:self.cutoff]   # <-- define to_score even if empty
+        if to_score:
+            pairs = [(query, c["text"]) for c in to_score]
+            loop = asyncio.get_event_loop()
+            scores = await loop.run_in_executor(None, self.model.predict, pairs)
+            for chunk, score in zip(to_score, scores):
+                chunk["rerank_score"] = float(score)
+            to_score.sort(key=lambda x: x["rerank_score"], reverse=True)
+
+        # Summaries get a high score
+        for sc in summary_chunks:
+            sc["rerank_score"] = 1.0
+
+        # Merge: summaries first, then top normal chunks
+        merged = summary_chunks + to_score
+        return merged[:top_k]
 
 _reranker = None
 

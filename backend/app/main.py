@@ -1,12 +1,11 @@
 # backend/app/main.py
 import time
 import json
-import tempfile
 import os
 from contextlib import asynccontextmanager
 from typing import Dict, Any, List, Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -26,14 +25,13 @@ from app.graph import get_graph
 from app.state import ReflexionState
 from app.utils import get_redis_client, get_logger
 
-# Prometheus metrics
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
 logger = get_logger(__name__)
 
-# ========== Metrics ==========
 REQUESTS = Counter("autoreq_requests_total", "Total HTTP requests", ["method", "endpoint"])
 REQUEST_DURATION = Histogram("autoreq_request_duration_seconds", "Request latency", ["endpoint"])
+
 
 # ========== Request/Response Models ==========
 class QueryRequest(BaseModel):
@@ -58,13 +56,12 @@ class RetrieveResponse(BaseModel):
     chunks: List[Dict[str, Any]]
     retrieval_time_ms: float
 
+
 # ========== Lifespan ==========
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     print("🚀 AutoRAG backend starting...")
     try:
-        # Preload embedder and ensure Qdrant collection
         embedder = get_embedder()
         redis_client = get_redis_client()
         embedder.set_redis(redis_client, settings.embedding_cache_ttl)
@@ -73,19 +70,16 @@ async def lifespan(app: FastAPI):
         await qdrant_manager.ensure_collection(embedder.dimension)
         print("✅ Embedder and Qdrant collection ready")
 
-        # Preload retriever and reranker (this downloads reranker model now)
         retriever = get_retriever()
         retriever.set_redis(redis_client, settings.embedding_cache_ttl)
         reranker = get_reranker()
-        print("✅ Retriever and reranker ready (reranker model loaded)")
+        print("✅ Retriever and reranker ready")
 
-        # Preload critic, rewriter, generator (no heavy downloads, but initialise clients)
         critic = get_critic()
         rewriter = get_rewriter()
         generator = get_generator()
         print("✅ Critic, Rewriter, Generator ready")
 
-        # Preload LangGraph (optional, but ensures graph is built)
         graph = get_graph()
         print("✅ LangGraph reflexion loop ready")
 
@@ -93,8 +87,8 @@ async def lifespan(app: FastAPI):
         print(f"⚠️ Startup error: {e}")
 
     yield
-    # Shutdown
     print("🛑 AutoRAG shutting down...")
+
 
 app = FastAPI(
     title="AutoRAG API",
@@ -103,7 +97,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://localhost:5173", "http://frontend:3000"],
@@ -112,16 +105,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ========== Health Check ==========
 @app.get("/health")
 async def health_check():
-    """Full health check with all dependencies."""
     status = {"status": "healthy", "services": {}}
-
-    # API
     status["services"]["api"] = "running"
 
-    # Redis
     try:
         redis_client = get_redis_client()
         redis_client.ping()
@@ -130,7 +120,6 @@ async def health_check():
         status["services"]["redis"] = f"error: {str(e)}"
         status["status"] = "degraded"
 
-    # Qdrant
     try:
         qdrant_manager = get_qdrant_manager()
         qdrant_manager.client.get_collections()
@@ -139,7 +128,6 @@ async def health_check():
         status["services"]["qdrant"] = f"error: {str(e)}"
         status["status"] = "degraded"
 
-    # Ollama
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(f"{settings.ollama_base_url}/api/tags", timeout=2.0)
@@ -152,7 +140,6 @@ async def health_check():
         status["services"]["ollama"] = f"error: {str(e)}"
         status["status"] = "degraded"
 
-    # Retriever / Reranker status
     try:
         retriever = get_retriever()
         reranker = get_reranker()
@@ -164,38 +151,29 @@ async def health_check():
 
     return status
 
+
 # ========== Ingestion Endpoints ==========
 @app.post("/ingest", response_model=IngestResponse)
 async def ingest_document_endpoint(
     file: UploadFile = File(...),
     metadata: Optional[str] = Form(None),
 ):
-    """
-    Upload a document (TXT or PDF) for asynchronous ingestion.
-    Returns a task_id to poll for completion.
-    """
     REQUESTS.labels(method="POST", endpoint="/ingest").inc()
-
-    # Read file content
     content = await file.read()
-
-    # Try to decode as text (for TXT files)
     try:
         file_content = content.decode("utf-8", errors="replace")
     except Exception:
-        raise HTTPException(status_code=400, detail="Only text files are supported in this demo (PDF support can be added)")
+        raise HTTPException(status_code=400, detail="Only text files are supported (PDF support can be added)")
 
-    # Parse metadata if provided
     meta_dict = {}
     if metadata:
         try:
             meta_dict = json.loads(metadata)
-        except:
+        except Exception:
             meta_dict = {"raw_metadata": metadata}
     meta_dict["filename"] = file.filename
     meta_dict["content_type"] = file.content_type
 
-    # Queue Celery task with content string
     task = ingest_document.delay(file_content, meta_dict)
 
     return IngestResponse(
@@ -204,9 +182,9 @@ async def ingest_document_endpoint(
         message=f"Document {file.filename} queued for ingestion."
     )
 
+
 @app.get("/ingest/{task_id}")
 async def get_ingestion_status(task_id: str):
-    """Check the status of an ingestion task."""
     task = celery_app.AsyncResult(task_id)
     if task.state == "PENDING":
         response = {"status": "pending", "progress": 0}
@@ -220,19 +198,17 @@ async def get_ingestion_status(task_id: str):
         response = {"status": task.state}
     return JSONResponse(response)
 
+
 @app.get("/collections")
 async def list_collections():
-    """List Qdrant collections (for debugging)."""
     manager = get_qdrant_manager()
     collections = manager.client.get_collections().collections
     return {"collections": [c.name for c in collections]}
 
+
 # ========== Retrieval & Reranking Endpoint ==========
 @app.post("/retrieve", response_model=RetrieveResponse)
 async def test_retrieve(request: RetrieveRequest):
-    """
-    Test endpoint that performs hybrid search + reranking and returns chunks.
-    """
     REQUESTS.labels(method="POST", endpoint="/retrieve").inc()
     start_time = time.time()
 
@@ -249,43 +225,43 @@ async def test_retrieve(request: RetrieveRequest):
         retrieval_time_ms=round(elapsed_ms, 2)
     )
 
+
 # ========== Full Reflexion Query ==========
 @app.post("/query", response_model=QueryResponse)
 async def query_endpoint(request: QueryRequest):
-    """
-    Full reflexion loop: retrieve → critic → (rewrite) → generate.
-    Returns answer and metadata (loops, scores, etc.).
-    """
     REQUESTS.labels(method="POST", endpoint="/query").inc()
     start_time = time.time()
-    
-    # Initialise state (as a dict, because LangGraph uses dicts)
+
     initial_state = ReflexionState(
         original_query=request.query,
         current_query=request.query,
         loop_count=0,
-    ).dict()  # convert to dict for LangGraph
-    
-    # Execute LangGraph
+    )
+    # FIX: Pydantic v2 deprecates .dict() — use .model_dump() instead.
+    # Gracefully support both versions.
+    try:
+        initial_state_dict = initial_state.model_dump()
+    except AttributeError:
+        initial_state_dict = initial_state.dict()
+
     graph = get_graph()
-    final_state = await graph.ainvoke(initial_state)
-    
+    final_state = await graph.ainvoke(initial_state_dict)
+
     elapsed_ms = (time.time() - start_time) * 1000
-    
-    # Access as dictionary (not attribute)
+
     metadata = {
-        "phase": 4,
         "original_query": request.query,
         "final_query": final_state.get("current_query", request.query),
         "loop_count": final_state.get("loop_count", 0),
         "critic_score": final_state.get("critique_score"),
         "critic_reason": final_state.get("critique_reason"),
         "chunks_used": len(final_state.get("retrieved_chunks", [])),
-        "total_latency_ms": round(elapsed_ms, 2)
+        "total_latency_ms": round(elapsed_ms, 2),
     }
-    
+
     answer = final_state.get("final_answer", "No answer generated.")
     return QueryResponse(answer=answer, metadata=metadata)
+
 
 # ========== Debug/Utility Endpoints ==========
 @app.get("/test_embedding")
@@ -294,21 +270,20 @@ async def test_embedding(text: str):
     emb = await embedder.embed(text)
     return {"text": text[:50], "embedding_length": len(emb)}
 
-# ========== Metrics ==========
+
 @app.get("/metrics")
 async def metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-# ========== Root Info ==========
+
 @app.get("/")
 async def root():
     return {
         "service": "AutoRAG",
-        "phase": 4,
         "docs": "/docs",
         "health": "/health",
         "metrics": "/metrics",
         "retrieve": "/retrieve (POST)",
         "query": "/query (POST with reflexion loop)",
-        "ingest": "/ingest (POST)"
+        "ingest": "/ingest (POST)",
     }

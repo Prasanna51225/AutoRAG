@@ -55,8 +55,8 @@ services:
       - OLLAMA_MODEL=llama3.2:3b
       - EMBEDDING_CACHE_TTL=3600
       - RERANKER_MODEL=BAAI/bge-reranker-base
-      - RERANKER_CUTOFF=50
-      - MAX_LOOPS=3
+      - RERANKER_CUTOFF=100
+      - MAX_LOOPS=2
       - CRITIC_THRESHOLD=0.3
       - HYBRID_ALPHA=0.6
       - DYNAMIC_TOPK=true

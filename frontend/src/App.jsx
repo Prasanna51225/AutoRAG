@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+// frontend/src/App.jsx
+import { useState, useEffect, useCallback } from 'react'
 import { sendQuery, uploadFile, getIngestionStatus } from './services/api'
 import { useLocalStorage } from './hooks/useLocalStorage'
 import { useDarkMode } from './hooks/useDarkMode'
@@ -10,52 +11,73 @@ function generateId() {
   return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
 }
 
+function deriveTitle(query) {
+  // Use first 40 chars of first user message as the session title
+  return query.length > 40 ? query.slice(0, 40).trimEnd() + '…' : query
+}
+
 export default function App() {
-  const [sessions, setSessions] = useLocalStorage('chat_sessions', [])
+  const [sessions, setSessions] = useLocalStorage('autorag_sessions_v2', [])
   const [currentSessionId, setCurrentSessionId] = useState(null)
   const [messages, setMessages] = useState([])
   const [isLoading, setIsLoading] = useState(false)
   const [isUploading, setIsUploading] = useState(false)
   const [darkMode, setDarkMode] = useDarkMode()
-  const pendingMessageRef = useRef(null)
 
-  // Load current session messages
+  // Sync messages from selected session
   useEffect(() => {
     if (currentSessionId) {
       const session = sessions.find(s => s.id === currentSessionId)
-      if (session) {
-        setMessages(session.messages || [])
-      } else {
-        setMessages([])
-      }
+      setMessages(session ? (session.messages || []) : [])
     } else {
       setMessages([])
     }
-  }, [currentSessionId, sessions])
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentSessionId])
 
-  const saveMessages = useCallback((sessionId, newMessages) => {
-    setSessions(prev => prev.map(s => 
-      s.id === sessionId ? { ...s, messages: newMessages, updatedAt: Date.now() } : s
+  const persistMessages = useCallback((sessionId, newMessages, titleOverride) => {
+    setSessions(prev => prev.map(s =>
+      s.id === sessionId
+        ? {
+            ...s,
+            messages: newMessages,
+            updatedAt: Date.now(),
+            ...(titleOverride ? { title: titleOverride } : {}),
+          }
+        : s
     ))
   }, [setSessions])
 
-  const createNewChat = () => {
+  const createNewChat = useCallback(() => {
     const newId = generateId()
-    const newSession = {
-      id: newId,
-      title: 'New conversation',
-      messages: [],
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    }
-    setSessions(prev => [newSession, ...prev])
+    setSessions(prev => [
+      {
+        id: newId,
+        title: 'New conversation',
+        messages: [],
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      },
+      ...prev,
+    ])
     setCurrentSessionId(newId)
+    setMessages([])
     return newId
-  }
+  }, [setSessions])
 
-  const selectSession = (id) => {
-    setCurrentSessionId(id)
-  }
+  const selectSession = (id) => setCurrentSessionId(id)
+
+  const deleteSession = useCallback((id) => {
+    setSessions(prev => prev.filter(s => s.id !== id))
+    if (id === currentSessionId) {
+      setCurrentSessionId(null)
+      setMessages([])
+    }
+  }, [setSessions, currentSessionId])
+
+  const renameSession = useCallback((id, newTitle) => {
+    setSessions(prev => prev.map(s => s.id === id ? { ...s, title: newTitle } : s))
+  }, [setSessions])
 
   const clearHistory = () => {
     setSessions([])
@@ -63,63 +85,65 @@ export default function App() {
     setMessages([])
   }
 
-  const addMessage = (role, content, metadata = null, isUploadingFlag = false) => {
-    const newMessages = [...messages, { role, content, metadata, isUploading: isUploadingFlag, timestamp: Date.now() }]
-    setMessages(newMessages)
-    if (currentSessionId) {
-      saveMessages(currentSessionId, newMessages)
-    }
-    return newMessages
-  }
-
-  const updateLastMessage = (content, metadata = null) => {
-    const newMessages = [...messages]
-    if (newMessages.length > 0) {
-      newMessages[newMessages.length - 1].content = content
-      if (metadata) newMessages[newMessages.length - 1].metadata = metadata
-      setMessages(newMessages)
-      if (currentSessionId) {
-        saveMessages(currentSessionId, newMessages)
-      }
-    }
-  }
-
   const handleSendMessage = async (query) => {
     let sessionId = currentSessionId
+    let isNewSession = false
+
     if (!sessionId) {
-      sessionId = createNewChat()
-      // Small delay to ensure state updates before adding message
-      await new Promise(r => setTimeout(r, 50))
+      sessionId = generateId()
+      isNewSession = true
+      setSessions(prev => [
+        {
+          id: sessionId,
+          title: deriveTitle(query),  // title set immediately from first message
+          messages: [],
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+        },
+        ...prev,
+      ])
+      setCurrentSessionId(sessionId)
     }
 
-    // Add user message immediately
     const userMsg = { role: 'user', content: query, timestamp: Date.now() }
-    setMessages(prev => [...prev, userMsg])
-    if (sessionId) {
-      setSessions(prev => prev.map(s => 
-        s.id === sessionId ? { ...s, messages: [...(s.messages || []), userMsg], updatedAt: Date.now() } : s
-      ))
-    }
+    const messagesWithUser = [...messages, userMsg]
+    setMessages(messagesWithUser)
+
+    // Update session: set title from first real message if brand new
+    setSessions(prev => prev.map(s =>
+      s.id === sessionId
+        ? {
+            ...s,
+            messages: messagesWithUser,
+            updatedAt: Date.now(),
+            ...(isNewSession ? { title: deriveTitle(query) } : {}),
+          }
+        : s
+    ))
+
     setIsLoading(true)
 
     try {
       const response = await sendQuery(query)
-      const assistantMsg = { role: 'assistant', content: response.answer, metadata: response.metadata, timestamp: Date.now() }
-      setMessages(prev => [...prev, assistantMsg])
-      if (sessionId) {
-        setSessions(prev => prev.map(s => 
-          s.id === sessionId ? { ...s, messages: [...(s.messages || []), assistantMsg], updatedAt: Date.now() } : s
-        ))
+      const assistantMsg = {
+        role: 'assistant',
+        content: response.answer,
+        metadata: response.metadata,
+        timestamp: Date.now(),
       }
+      const finalMessages = [...messagesWithUser, assistantMsg]
+      setMessages(finalMessages)
+      persistMessages(sessionId, finalMessages)
     } catch (error) {
       console.error('Query error:', error)
-      const errorMsg = { role: 'assistant', content: 'Sorry, an error occurred while processing your request. Please try again.', timestamp: Date.now() }
-      setMessages(prev => [...prev, errorMsg])
-      if (sessionId) {
-        setSessions(prev => prev.map(s => 
-          s.id === sessionId ? { ...s, messages: [...(s.messages || []), errorMsg], updatedAt: Date.now() } : s
-        ))
+      const errorMsg = {
+        role: 'assistant',
+        content: 'Sorry, an error occurred while processing your request. Please try again.',
+        timestamp: Date.now(),
       }
+      const finalMessages = [...messagesWithUser, errorMsg]
+      setMessages(finalMessages)
+      persistMessages(sessionId, finalMessages)
     } finally {
       setIsLoading(false)
     }
@@ -128,87 +152,87 @@ export default function App() {
   const handleAttachFile = async (file) => {
     let sessionId = currentSessionId
     if (!sessionId) {
-      sessionId = createNewChat()
-      await new Promise(r => setTimeout(r, 50))
+      sessionId = generateId()
+      const title = `File: ${file.name}`
+      setSessions(prev => [
+        { id: sessionId, title, messages: [], createdAt: Date.now(), updatedAt: Date.now() },
+        ...prev,
+      ])
+      setCurrentSessionId(sessionId)
     }
 
-    const systemMsg = { role: 'system', content: `Uploading ${file.name}...`, isUploading: true, timestamp: Date.now() }
-    setMessages(prev => [...prev, systemMsg])
-    if (sessionId) {
-      setSessions(prev => prev.map(s => 
-        s.id === sessionId ? { ...s, messages: [...(s.messages || []), systemMsg], updatedAt: Date.now() } : s
-      ))
+    const uploadingMsg = {
+      role: 'system',
+      content: `Uploading ${file.name}…`,
+      isUploading: true,
+      timestamp: Date.now(),
     }
+    const msgsWithUpload = [...messages, uploadingMsg]
+    setMessages(msgsWithUpload)
+    persistMessages(sessionId, msgsWithUpload)
     setIsUploading(true)
+
+    const updateLastMsg = (newContent, extra = {}) => {
+      setMessages(prev => {
+        const updated = [...prev]
+        updated[updated.length - 1] = { ...updated[updated.length - 1], content: newContent, ...extra }
+        persistMessages(sessionId, updated)
+        return updated
+      })
+    }
 
     try {
       const uploadRes = await uploadFile(file, (percent) => {
-        const updatedMsg = { ...systemMsg, content: `Uploading ${file.name}... ${percent}%` }
-        setMessages(prev => prev.map((m, i) => i === prev.length-1 ? updatedMsg : m))
-        if (sessionId) {
-          setSessions(prevS => prevS.map(s => 
-            s.id === sessionId ? { ...s, messages: s.messages?.map((m, i) => i === s.messages.length-1 ? updatedMsg : m) || [] } : s
-          ))
-        }
+        updateLastMsg(`Uploading ${file.name}… ${percent}%`)
       })
       const taskId = uploadRes.task_id
 
       let completed = false
       let attempts = 0
-      while (!completed && attempts < 60) {
+      while (!completed && attempts < 180) {
         await new Promise(r => setTimeout(r, 2000))
         const statusRes = await getIngestionStatus(taskId)
         if (statusRes.status === 'completed') {
           completed = true
           const chunks = statusRes.result?.chunks_processed || 0
-          const successMsg = { role: 'system', content: `✅ File "${file.name}" ingested successfully (${chunks} chunks). You can now ask questions about it.`, timestamp: Date.now() }
-          setMessages(prev => [...prev.slice(0, -1), successMsg])
-          if (sessionId) {
-            setSessions(prevS => prevS.map(s => 
-              s.id === sessionId ? { ...s, messages: [...(s.messages?.slice(0, -1) || []), successMsg], updatedAt: Date.now() } : s
-            ))
-          }
+          updateLastMsg(
+            `✅ "${file.name}" ingested (${chunks} chunks). You can now ask questions about it.`,
+            { isUploading: false }
+          )
         } else if (statusRes.status === 'failed') {
           throw new Error(statusRes.error || 'Ingestion failed')
         }
         attempts++
       }
       if (!completed) {
-        const timeoutMsg = { role: 'system', content: `⚠️ File "${file.name}" ingestion is taking longer than expected. You can still ask questions, but new content may not be available yet.`, timestamp: Date.now() }
-        setMessages(prev => [...prev.slice(0, -1), timeoutMsg])
-        if (sessionId) {
-          setSessions(prevS => prevS.map(s => 
-            s.id === sessionId ? { ...s, messages: [...(s.messages?.slice(0, -1) || []), timeoutMsg], updatedAt: Date.now() } : s
-          ))
-        }
+        updateLastMsg(
+          `⚠️ "${file.name}" ingestion is taking longer than expected. Content may not be ready yet.`,
+          { isUploading: false }
+        )
       }
     } catch (error) {
       console.error('Upload error:', error)
-      const errorMsg = { role: 'system', content: `❌ Failed to upload "${file.name}": ${error.message}`, timestamp: Date.now() }
-      setMessages(prev => [...prev.slice(0, -1), errorMsg])
-      if (sessionId) {
-        setSessions(prevS => prevS.map(s => 
-          s.id === sessionId ? { ...s, messages: [...(s.messages?.slice(0, -1) || []), errorMsg], updatedAt: Date.now() } : s
-        ))
-      }
+      updateLastMsg(`❌ Failed to upload "${file.name}": ${error.message}`, { isUploading: false })
     } finally {
       setIsUploading(false)
     }
   }
 
   return (
-    <div className="flex h-screen bg-slate-50 dark:bg-slate-900">
+    <div className={`flex h-screen overflow-hidden ${darkMode ? 'dark' : ''}`}>
       <Sidebar
         sessions={sessions}
         currentSessionId={currentSessionId}
         onNewChat={createNewChat}
         onSelectSession={selectSession}
+        onDeleteSession={deleteSession}
+        onRenameSession={renameSession}
         onClearHistory={clearHistory}
         darkMode={darkMode}
         setDarkMode={setDarkMode}
       />
-      <div className="flex-1 flex flex-col">
-        <ChatArea messages={messages} isLoading={isLoading} isUploading={isUploading} />
+      <div className="flex-1 flex flex-col bg-white dark:bg-[#212121] min-w-0">
+        <ChatArea messages={messages} isLoading={isLoading} />
         <InputBox
           onSendMessage={handleSendMessage}
           onAttachFile={handleAttachFile}

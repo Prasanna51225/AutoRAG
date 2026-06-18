@@ -37,11 +37,11 @@ class HybridRetriever:
         self.embedder = get_embedder()
         self.sparse_vectorizer = get_sparse_vectorizer()
         self.cache = None
-        logger.info("HybridRetriever initialised (dense-only)")
+        logger.info("HybridRetriever initialised")
 
     def set_redis(self, redis_client: redis.Redis, ttl: int = 3600):
-        self.cache = QueryCache(redis_client, ttl)
         self.embedder.set_redis(redis_client, ttl)
+        self.cache = QueryCache(redis_client, ttl)
 
     async def retrieve(self, query: str, top_k: int = 20) -> List[Dict[str, Any]]:
         if self.cache:
@@ -51,15 +51,22 @@ class HybridRetriever:
                 return cached
 
         dense_vec = await self.embedder.embed(query)
+        sparse_vec = self.sparse_vectorizer.vectorize(query)
 
-        # Use named vector "dense" (must match collection vector name)
-        results = await asyncio.to_thread(
-            self.qdrant.client.search,
-            collection_name=self.qdrant.collection_name,
-            query_vector=("dense", dense_vec),   # Tuple: (vector_name, vector)
-            limit=top_k,
-            with_payload=True,
-        )
+        try:
+            results = await asyncio.to_thread(
+                self.qdrant.search_hybrid,
+                dense_vec,
+                sparse_vec,
+                top_k,
+            )
+        except Exception as e:
+            logger.warning(f"Hybrid search failed ({e}), falling back to dense-only")
+            results = await asyncio.to_thread(
+                self.qdrant.search_dense,
+                dense_vec,
+                top_k,
+            )
 
         chunks = []
         for hit in results:

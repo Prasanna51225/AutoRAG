@@ -24,7 +24,7 @@ export async function uploadFile(file, onProgress) {
       }
     },
   })
-  return response.data // { task_id, status, message }
+  return response.data
 }
 
 export async function getIngestionStatus(taskId) {
