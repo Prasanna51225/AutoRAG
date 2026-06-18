@@ -1,6 +1,6 @@
 # AutoRAG
 
-A production-ready RAG system that actually knows when its retrieval is bad — and fixes it.
+A  RAG system that actually knows when its retrieval is bad — and fixes it.
 
 Most RAG setups are one-shot: you ask, it searches, it answers. If the search comes back with garbage, the answer is garbage too. AutoRAG adds a reflexion loop on top, where a critic LLM grades the retrieved chunks and, if they're not good enough, a rewriter LLM rephrases the query and tries again. Up to two rounds. No manual intervention needed.
 
@@ -72,49 +72,73 @@ AutoRAG/
 
 ---
 Architecture :
-flowchart TD
-    %% Define color styles for different architecture layers
-    classDef frontend fill:#e1f5fe,stroke:#03a9f4,stroke-width:2px,color:#000
-    classDef backend fill:#fff3e0,stroke:#ff9800,stroke-width:2px,color:#000
-    classDef ai fill:#f3e5f5,stroke:#9c27b0,stroke-width:2px,color:#000
-    classDef db fill:#e8f5e9,stroke:#4caf50,stroke-width:2px,color:#000
-    classDef worker fill:#ffebee,stroke:#f44336,stroke-width:2px,color:#000
 
-    Client["Client Browser<br/>(React + Tailwind Frontend)"]:::frontend
-
-    Gateway["FastAPI Gateway (Backend)<br/>• Receives user queries & file uploads<br/>• Validates requests (Pydantic)<br/>• Spawns the LangGraph reflexion loop<br/>• Exposes Prometheus metrics & OpenAPI docs"]:::backend
-
-    Client -- "HTTP (REST API)" --> Gateway
-
-    subgraph LangGraphLoop ["LangGraph Reflexion Loop (Max loops: 3 | Fallback: Polite 'can't answer')"]
-        direction LR
-        Retrieve["Retrieve<br/>(hybrid)"]:::ai
-        Rerank["Rerank<br/>(BGE)"]:::ai
-        Critic["Critic<br/>(LLM)"]:::ai
-        Generate["Generate or<br/>Rewrite"]:::ai
-        Rewriter["Query Rewriter<br/>(LLM - rewrites query<br/>to improve retrieval)"]:::ai
-
-        Retrieve --> Rerank --> Critic
-        Critic -- "Score >= 0.7" --> Generate
-        Critic -- "Score < 0.7" --> Rewriter
-        Rewriter -- "Loop back" --> Retrieve
-    end
-
-    Gateway --> LangGraphLoop
-
-    Qdrant[("Qdrant<br/>(Vector DB)<br/>• Stores dense + sparse vectors<br/>• Hybrid search<br/>• Payload storage")]:::db
-    Ollama[["Ollama<br/>(LLM Server)<br/>• llama3.2:3b<br/>• Used for: Critic, Rewriter, Generator"]]:::db
-    Redis[("Redis<br/>(Cache + Broker)<br/>• Embedding cache<br/>• Query result cache<br/>• Celery message broker<br/>• Session storage")]:::db
-
-    LangGraphLoop --> Qdrant
-    LangGraphLoop --> Ollama
-    LangGraphLoop --> Redis
-
-    Celery["Celery Worker<br/>• Listens to Redis queue<br/>1. Chunk documents (RecursiveCharacterTextSplitter)<br/>2. Generate dense embeddings (MiniLM)<br/>3. Generate sparse vectors (BM25)<br/>4. Upsert to Qdrant"]:::worker
-
-    Redis --> Celery
-    Celery -. "Upserts" .-> Qdrant
-
+```text
++-----------------------------------------------------------------------------+
+|                              Client Browser                                 |
+|                        (React + Tailwind Frontend)                          |
++-----------------------------------+-----------------------------------------+
+                                    |
+                                    | HTTP (REST API)
+                                    v
++-----------------------------------------------------------------------------+
+|                           FastAPI Gateway (Backend)                         |
+|                                                                             |
+|  • Receives user queries and file uploads                                   |
+|  • Validates requests (Pydantic)                                            |
+|  • Spawns the LangGraph reflexion loop                                      |
+|  • Exposes Prometheus metrics and OpenAPI docs                              |
++-----------------------------------+-----------------------------------------+
+                                    |
+                                    v
++-----------------------------------------------------------------------------+
+|                         LangGraph Reflexion Loop                            |
+|                                                                             |
+|   +----------+    +----------+    +----------+    +---------------+         |
+|   | Retrieve |--->|  Rerank  |--->|  Critic  |--->|  Generate or  |         |
+|   | (hybrid) |    | (BGE)    |    | (LLM)    |    |   Rewrite     |         |
+|   +----------+    +----------+    +----+-----+    +---------------+         |
+|                                        |                                    |
+|                          if score < 0.7|-------------------------+          |
+|                                        v                         |          |
+|                             +-------------------+                |          |
+|                             | Query Rewriter    |                |          |
+|                             | (LLM - rewrites   |                |          |
+|                             |  query to improve)|                |          |
+|                             +---------+---------+                |          |
+|                                       |                          |          |
+|                                       +--------------------------+          |
+|                                         (loop back to Retrieve)             |
+|                                                                             |
+|   Max loops: 2                                                              |
+|   Fallback: polite "can't answer" message                                   |
++-----------------------------------+-----------------------------------------+
+                                    |
+              +---------------------+---------------------+
+              |                     |                     |
+              v                     v                     v
++---------------------+ +---------------------+ +-------------------------+
+|      Qdrant         | |      Ollama         | |        Redis            |
+|   (Vector DB)       | |   (LLM Server)      | |   (Cache + Broker)      |
+|                     | |                     | |                         |
+|  • Dense/sparse     | |  • llama3.2:3b      | |  • Embedding cache      |
+|  • Hybrid search    | |  • Critic/Rewrite   | |  • Query result cache   |
+|  • Payload storage  | |  • Generator        | |  • Celery msg broker    |
++---------------------+ +---------------------+ +-------------------------+
+                                    |
+                                    |
+                                    v
++-----------------------------------------------------------------------------+
+|                              Celery Worker                                  |
+|                                                                             |
+|  • Listens to Redis queue                                                   |
+|  • Processes ingestion tasks:                                               |
+|    1. Chunk documents (RecursiveCharacterTextSplitter)                      |
+|    2. Generate dense embeddings (MiniLM)                                    |
+|    3. Generate sparse vectors (BM25)                                        |
+|    4. Upsert to Qdrant                                                      |
++-----------------------------------------------------------------------------+
+```
 
 ## Getting started
 
@@ -150,7 +174,7 @@ Tracked metrics include request count, latency, reflexion loop count, critic sco
 
 ## Why LangGraph instead of a simple loop?
 
-LangGraph gives you an explicit state machine with conditional edges, which makes the reflexion loop easy to inspect and debug. You can see exactly which node the system is in at any point, and adding new steps (like a second critic or a fallback retriever) is straightforward without untangling spaghetti chains.
+LangGraph gives you an explicit state machine with conditional edges, which makes the reflexion loop easy to inspect and debug. You can see exactly which node the system is in at any point, and adding new steps (like a second critic or a fallback retriever) is straightforward.
 
 ---
 
